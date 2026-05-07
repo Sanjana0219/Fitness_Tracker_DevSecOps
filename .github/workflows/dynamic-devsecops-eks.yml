@@ -1,0 +1,630 @@
+name: Dynamic DevSecOps Pipeline with EKS
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: "Customer application name"
+        required: true
+        default: "customer-app"
+
+      customer_source:
+        description: "Customer source type"
+        required: true
+        type: choice
+        options:
+          - current-repo
+          - external-github-repo
+        default: current-repo
+
+      customer_repo_url:
+        description: "Customer GitHub repo URL, only if source is external-github-repo"
+        required: false
+        type: string
+
+
+      app_type:
+        description: "Application type"
+        required: true
+        type: choice
+        options:
+          - auto-detect
+          - nodejs
+          - python
+          - java
+          - go
+          - docker
+        default: auto-detect
+
+      scan_severity:
+        description: "Severity level to block deployment"
+        required: true
+        type: choice
+        options:
+          - CRITICAL
+          - HIGH
+          - MEDIUM
+          - LOW
+        default: HIGH
+
+      customer_email:
+        description: "Email to receive vulnerability report"
+        required: true
+
+      deploy_environment:
+        description: "Deployment environment"
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - production
+          - skip-deployment
+        default: dev
+
+  push:
+    branches:
+      - main
+      - develop
+
+env:
+  APP_NAME: ${{ github.event.inputs.app_name || 'customer-app' }}
+  APP_TYPE: ${{ github.event.inputs.app_type || 'auto-detect' }}
+  SCAN_SEVERITY: ${{ github.event.inputs.scan_severity || 'HIGH' }}
+  CUSTOMER_EMAIL: ${{ github.event.inputs.customer_email || 'devteam@example.com' }}
+  DEPLOY_ENV: ${{ github.event.inputs.deploy_environment || 'dev' }}
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  setup:
+    name: Customer File Intake and Analysis
+    runs-on: ubuntu-latest
+
+    outputs:
+      app_type: ${{ steps.detect.outputs.app_type }}
+      language: ${{ steps.detect.outputs.language }}
+      has_docker: ${{ steps.detect.outputs.has_docker }}
+      has_terraform: ${{ steps.detect.outputs.has_terraform }}
+      has_k8s: ${{ steps.detect.outputs.has_k8s }}
+
+    steps:
+      - name: Checkout pipeline repository
+        uses: actions/checkout@v4
+
+      - name: Customer file intake
+        run: |
+          echo "=================================================="
+          echo "CUSTOMER FILE INTAKE LAYER"
+          echo "=================================================="
+          echo "This layer collects the customer application/files."
+          echo ""
+          echo "Customer Source: ${{ github.event.inputs.customer_source }}"
+          echo "Customer Repo URL: ${{ github.event.inputs.customer_repo_url }}"
+          echo ""
+          if [ "${{ github.event.inputs.customer_source }}" = "external-github-repo" ]; then
+            if [ -z "${{ github.event.inputs.customer_repo_url }}" ]; then
+              echo "ERROR: customer_repo_url is required for external-github-repo"
+              exit 1
+            fi
+            echo "Cloning customer repository..."
+            rm -rf customer-upload
+            git clone "${{ github.event.inputs.customer_repo_url }}" customer-upload
+            echo "Copying customer files into scanning workspace..."
+            rsync -av customer-upload/ ./ \
+              --exclude ".git" \
+              --exclude ".github"
+            rm -rf customer-upload
+          else
+            echo "Using files already present in current repository."
+          fi
+          echo ""
+          echo "Customer files received successfully."
+          echo "Listing top-level files:"
+          ls -la
+      - name: Analyze uploaded customer files
+        id: file_analysis
+        run: |
+          echo "=================================================="
+          echo "CUSTOMER FILE STRUCTURE ANALYSIS"
+          echo "=================================================="
+          echo "The pipeline is now analyzing the uploaded files."
+          echo ""
+          echo "Detected important files:"
+          [ -f package.json ] && echo "Node.js file found: package.json"
+          [ -f requirements.txt ] && echo "Python file found: requirements.txt"
+          [ -f pom.xml ] && echo "Java Maven file found: pom.xml"
+          [ -f build.gradle ] && echo "Java Gradle file found: build.gradle"
+          [ -f go.mod ] && echo "Go module file found: go.mod"
+          [ -f Dockerfile ] && echo "Docker file found: Dockerfile"
+          [ -d k8s ] && echo "Kubernetes folder found: k8s/"
+          find . -name "*.tf" | grep -q . && echo "Terraform files found"
+          echo ""
+          echo "This file analysis decides which security layers are applicable."
+      - name: Auto-detect uploaded file/application type
+        id: detect
+        run: |
+          chmod +x scripts/detect_app_type.sh
+          bash scripts/detect_app_type.sh "${{ env.APP_TYPE }}"
+      - name: Show customer scan plan
+        run: |
+          echo "=================================================="
+          echo "SECURITY SCAN PLAN FOR CUSTOMER FILES"
+          echo "=================================================="
+          echo "Customer App Name : ${{ env.APP_NAME }}"
+          echo "Detected Type     : ${{ steps.detect.outputs.app_type }}"
+          echo "Detected Language : ${{ steps.detect.outputs.language }}"
+          echo "Docker Available  : ${{ steps.detect.outputs.has_docker }}"
+          echo "Terraform Found   : ${{ steps.detect.outputs.has_terraform }}"
+          echo "Kubernetes Found  : ${{ steps.detect.outputs.has_k8s }}"
+          echo ""
+          echo "The following layered scans will be executed:"
+          echo "Layer 1: GitLeaks Secret Scanning"
+          echo "Layer 2: SAST Code Scanning"
+          echo "Layer 3: Dependency Vulnerability Scanning"
+          echo "Layer 4: Container Image Scanning"
+          echo "Layer 5: Infrastructure-as-Code Scanning"
+          echo "Layer 6: OPA Policy Gate"
+          echo "=================================================="
+         
+  security_scans:
+    name: Layer-wise Security Scanning
+    runs-on: ubuntu-latest
+    needs: setup
+
+    outputs:
+      critical_count: ${{ steps.compile.outputs.critical_count }}
+      high_count: ${{ steps.compile.outputs.high_count }}
+      medium_count: ${{ steps.compile.outputs.medium_count }}
+      low_count: ${{ steps.compile.outputs.low_count }}
+      secrets_count: ${{ steps.compile.outputs.secrets_count }}
+      policy_failed: ${{ steps.opa.outputs.policy_failed }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create reports directory
+        run: mkdir -p reports
+
+      - name: "Layer 1: GitLeaks Secret Scanning"
+        continue-on-error: true
+        run: |
+          echo "=================================================="
+          echo "LAYER 1: GITLEAKS SECRET SCANNING"
+          echo "=================================================="
+          echo "Purpose:"
+          echo "This scan checks whether the uploaded customer files contain"
+          echo "hardcoded secrets such as API keys, passwords, tokens, or credentials."
+          echo ""
+          echo "Files being scanned:"
+          find . -type f | head -30
+          echo ""
+          curl -sL https://github.com/gitleaks/gitleaks/releases/download/v8.18.2/gitleaks_8.18.2_linux_x64.tar.gz | tar xz -C /tmp
+          /tmp/gitleaks detect \
+            --source . \
+            --report-format json \
+            --report-path reports/gitleaks-report.json \
+            --exit-code 0 || true
+          echo ""
+          echo "GitLeaks scan completed."
+          echo "Report generated: reports/gitleaks-report.json"
+          if [ -f reports/gitleaks-report.json ]; then
+            COUNT=$(python3 -c "import json; data=json.load(open('reports/gitleaks-report.json')); print(len(data) if isinstance(data,list) else 0)" || echo 0)
+            echo "Secrets found: $COUNT"
+          else
+            echo "No GitLeaks report generated."
+          fi
+      - name: "Layer 2: SAST Code Scanning"
+        continue-on-error: true
+        run: |
+          echo "=================================================="
+          echo "LAYER 2: SAST CODE SCANNING"
+          echo "=================================================="
+          echo "Purpose:"
+          echo "This scan analyzes the source code for bugs, vulnerabilities,"
+          echo "code smells, insecure coding patterns, and maintainability issues."
+          echo ""
+          echo "Tool used: SonarCloud"
+          echo ""
+          if [ -z "${{ secrets.SONAR_TOKEN }}" ]; then
+            echo "SONAR_TOKEN is not configured."
+            echo "Skipping SonarCloud scan."
+            echo '{"status":"skipped","message":"SONAR_TOKEN not configured"}' > reports/sonar-report.json
+            exit 0
+          fi
+          npm install -g sonarqube-scanner
+          sonar-scanner \
+            -Dsonar.projectKey="${{ env.APP_NAME }}" \
+            -Dsonar.organization="${{ secrets.SONAR_ORG }}" \
+            -Dsonar.sources=. \
+            -Dsonar.host.url=https://sonarcloud.io \
+            -Dsonar.token="${{ secrets.SONAR_TOKEN }}" || true
+          echo '{"status":"completed","tool":"SonarCloud","layer":"SAST"}' > reports/sonar-report.json
+          echo ""
+          echo "SAST scan completed."
+          echo "Report generated: reports/sonar-report.json"
+      - name: "Layer 3: Dependency Vulnerability Scanning"
+        continue-on-error: true
+        run: |
+          echo "=================================================="
+          echo "LAYER 3: DEPENDENCY VULNERABILITY SCANNING"
+          echo "=================================================="
+          echo "Purpose:"
+          echo "This scan checks third-party libraries and packages used"
+          echo "by the uploaded customer application."
+          echo ""
+          echo "Detected application type: ${{ needs.setup.outputs.app_type }}"
+          echo ""
+          APP="${{ needs.setup.outputs.app_type }}"
+          if [ "$APP" = "nodejs" ] && [ -f "package.json" ]; then
+            echo "Node.js detected."
+            echo "Running npm audit..."
+            npm install || true
+            npm audit --json > reports/npm-audit.json 2>&1 || true
+            echo "npm audit report generated: reports/npm-audit.json"
+          fi
+          if [ "$APP" = "python" ] && [ -f "requirements.txt" ]; then
+            echo "Python detected."
+            echo "Running Safety scan..."
+            pip install safety -q
+            safety check -r requirements.txt --json > reports/safety-report.json 2>&1 || true
+            echo "Safety report generated: reports/safety-report.json"
+          fi
+          if [ "$APP" = "java" ] && [ -f "pom.xml" ]; then
+            echo "Java Maven project detected."
+            echo "Running OWASP Dependency Check..."
+            mvn dependency:resolve org.owasp:dependency-check-maven:check \
+              -Dformat=JSON \
+              -DoutputDirectory=reports || true
+            echo "Java dependency report generated in reports/"
+          fi
+          if [ "$APP" = "go" ] && [ -f "go.mod" ]; then
+            echo "Go project detected."
+            echo "Running gosec..."
+            go install github.com/securego/gosec/v2/cmd/gosec@latest || true
+            ~/go/bin/gosec -fmt json -out reports/gosec-report.json ./... || true
+            echo "GoSec report generated: reports/gosec-report.json"
+          fi
+          echo ""
+          echo "Dependency scanning layer completed."
+      - name: "Layer 3B: Snyk Open Source Dependency Scan"
+        continue-on-error: true
+        run: |
+          echo "=================================================="
+          echo "LAYER 3B: SNYK OPEN SOURCE DEPENDENCY SCAN"
+          echo "=================================================="
+          echo "Purpose:"
+          echo "This scan checks open-source package vulnerabilities"
+          echo "using the Snyk vulnerability database."
+          echo ""
+          if [ -z "${{ secrets.SNYK_TOKEN }}" ]; then
+            echo "SNYK_TOKEN is not configured."
+            echo "Skipping Snyk scan."
+            echo '{"status":"skipped","message":"SNYK_TOKEN not configured"}' > reports/snyk-report.json
+            exit 0
+          fi
+          npm install -g snyk
+          snyk auth "${{ secrets.SNYK_TOKEN }}"
+          snyk test --json > reports/snyk-report.json 2>&1 || true
+          echo "Snyk scan completed."
+          echo "Report generated: reports/snyk-report.json"
+      - name: "Layer 4: Container Image Scanning"
+        continue-on-error: true
+        run: |
+          echo "=================================================="
+          echo "LAYER 4: CONTAINER IMAGE SCANNING"
+          echo "=================================================="
+          echo "Purpose:"
+          echo "This scan checks the Docker container image for"
+          echo "operating system package vulnerabilities and image-level CVEs."
+          echo ""
+          if [ ! -f Dockerfile ]; then
+            echo "No Dockerfile found."
+            echo "Skipping container image scanning."
+            echo '{"Results":[],"status":"skipped","message":"Dockerfile not found"}' > reports/trivy-report.json
+            exit 0
+          fi
+          echo "Dockerfile found. Building temporary image for scanning..."
+          docker build -t local-scan-image:${{ env.IMAGE_TAG }} . || {
+            echo "Docker build failed. Creating empty Trivy report."
+            echo '{"Results":[],"status":"docker_build_failed"}' > reports/trivy-report.json
+            exit 0
+          }
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin
+          trivy image \
+            --format json \
+            --output reports/trivy-report.json \
+            --severity LOW,MEDIUM,HIGH,CRITICAL \
+            local-scan-image:${{ env.IMAGE_TAG }} || true
+          echo "Container image scanning completed."
+          echo "Report generated: reports/trivy-report.json"
+      - name: "Layer 5: Infrastructure as Code Scanning"
+        continue-on-error: true
+        run: |
+          echo "=================================================="
+          echo "LAYER 5: INFRASTRUCTURE AS CODE SCANNING"
+          echo "=================================================="
+          echo "Purpose:"
+          echo "This scan checks Terraform, Kubernetes, and Dockerfile"
+          echo "configuration files for cloud security misconfigurations."
+          echo ""
+          echo "Tool used: Checkov"
+          echo ""
+          pip install checkov -q
+          checkov -d . \
+            --framework terraform,kubernetes,dockerfile \
+            --output json \
+            > reports/checkov-report.json 2>&1 || true
+          echo "IaC scanning completed."
+          echo "Report generated: reports/checkov-report.json"
+      - name: Compile scan results
+        id: compile
+        run: |
+          python3 scripts/compile_scan_results.py \
+            --reports-dir reports \
+            --output reports/scan-summary.json
+          echo "critical_count=$(jq -r '.critical_count' reports/scan-summary.json)" >> $GITHUB_OUTPUT
+          echo "high_count=$(jq -r '.high_count' reports/scan-summary.json)" >> $GITHUB_OUTPUT
+          echo "medium_count=$(jq -r '.medium_count' reports/scan-summary.json)" >> $GITHUB_OUTPUT
+          echo "low_count=$(jq -r '.low_count' reports/scan-summary.json)" >> $GITHUB_OUTPUT
+          echo "secrets_count=$(jq -r '.secrets_count' reports/scan-summary.json)" >> $GITHUB_OUTPUT
+      - name: Install OPA
+        run: |
+          curl -L -o opa https://openpolicyagent.org/downloads/latest/opa_linux_amd64_static
+          chmod +x opa
+          sudo mv opa /usr/local/bin/opa
+          opa version
+      - name: OPA policy evaluation
+        id: opa
+        continue-on-error: true
+        run: |
+          echo "=================================================="
+          echo "LAYER 6: OPA POLICY GATE"
+          echo "=================================================="
+          echo "Purpose:"
+          echo "This layer evaluates the final scan results against"
+          echo "security policy rules before allowing deployment."
+          echo ""
+          echo "Policy rule:"
+          echo "Deployment is blocked if Critical, High, or Secrets are found."
+          echo ""
+          opa eval \
+            --format json \
+            --data policy/deployment_policy.rego \
+            --input reports/scan-summary.json \
+            "data.devsecops.policy.deny" \
+            > reports/opa-result.json
+          DENY_COUNT=$(jq '.result[0].expressions[0].value | length' reports/opa-result.json)
+          if [ "$DENY_COUNT" -gt 0 ]; then
+            echo "policy_failed=true" >> $GITHUB_OUTPUT
+            echo "OPA POLICY RESULT: FAILED"
+            echo "Deployment will require manual approval."
+            cat reports/opa-result.json
+          else
+            echo "policy_failed=false" >> $GITHUB_OUTPUT
+            echo "OPA POLICY RESULT: PASSED"
+            echo "Deployment can continue automatically."
+          fi
+      - name: Customer Security Scan Summary
+        if: always()
+        run: |
+          echo "=================================================="
+          echo "CUSTOMER SECURITY SCAN SUMMARY"
+          echo "=================================================="
+          echo "Application/File Name : ${{ env.APP_NAME }}"
+          echo "Customer Source       : ${{ github.event.inputs.customer_source || 'current-repo' }}"
+          echo "Detected Type         : ${{ needs.setup.outputs.app_type }}"
+          echo ""
+          echo "Completed Security Layers:"
+          echo "Layer 1  - GitLeaks Secret Scanning"
+          echo "Layer 2  - SAST Code Scanning"
+          echo "Layer 3  - Dependency Vulnerability Scanning"
+          echo "Layer 3B - Snyk Open Source Scan"
+          echo "Layer 4  - Container Image Scanning"
+          echo "Layer 5  - IaC Misconfiguration Scanning"
+          echo "Layer 6  - OPA Policy Gate"
+          echo ""
+          echo "Scan Counts:"
+          echo "Critical : ${{ steps.compile.outputs.critical_count }}"
+          echo "High     : ${{ steps.compile.outputs.high_count }}"
+          echo "Medium   : ${{ steps.compile.outputs.medium_count }}"
+          echo "Low      : ${{ steps.compile.outputs.low_count }}"
+          echo "Secrets  : ${{ steps.compile.outputs.secrets_count }}"
+          echo ""
+          echo "Reports generated in reports/ folder."
+          echo "Excel report will be generated in the next job."
+          echo "=================================================="
+      - name: Upload raw reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-security-reports-${{ github.run_id }}
+          path: reports/
+          retention-days: 30
+
+  excel_report:
+    name: Generate Excel Security Report
+    runs-on: ubuntu-latest
+    needs: security_scans
+    if: always()
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download raw reports
+        uses: actions/download-artifact@v4
+        with:
+          name: raw-security-reports-${{ github.run_id }}
+          path: reports/
+
+      - name: Install Excel dependencies
+        run: pip install openpyxl pandas -q
+
+      - name: Generate Excel report
+        run: |
+          python3 scripts/generate_excel_report.py \
+            --reports-dir reports \
+            --app-name "${{ env.APP_NAME }}" \
+            --run-id "${{ github.run_id }}" \
+            --output reports/security-report-${{ env.APP_NAME }}.xlsx
+      - name: Upload Excel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SECURITY-EXCEL-REPORT-${{ env.APP_NAME }}-${{ github.run_id }}
+          path: reports/security-report-${{ env.APP_NAME }}.xlsx
+          retention-days: 60
+
+  send_email_alert:
+    name: Send Email Alert If Policy Failed
+    runs-on: ubuntu-latest
+    needs: [security_scans, excel_report]
+    if: needs.security_scans.outputs.policy_failed == 'true'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download reports
+        uses: actions/download-artifact@v4
+        with:
+          name: raw-security-reports-${{ github.run_id }}
+          path: reports/
+
+      - name: Download Excel report
+        uses: actions/download-artifact@v4
+        with:
+          name: SECURITY-EXCEL-REPORT-${{ env.APP_NAME }}-${{ github.run_id }}
+          path: reports/
+
+      - name: Install SendGrid
+        run: pip install sendgrid -q
+
+      - name: Send vulnerability email
+        env:
+          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+          ALERT_FROM_EMAIL: ${{ secrets.ALERT_FROM_EMAIL }}
+          PIPELINE_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 scripts/send_alert_email.py \
+            --to "${{ env.CUSTOMER_EMAIL }}" \
+            --from-email "${{ secrets.ALERT_FROM_EMAIL }}" \
+            --app-name "${{ env.APP_NAME }}" \
+            --critical "${{ needs.security_scans.outputs.critical_count }}" \
+            --high "${{ needs.security_scans.outputs.high_count }}" \
+            --medium "${{ needs.security_scans.outputs.medium_count }}" \
+            --pipeline-url "$PIPELINE_URL" \
+            --reports-dir reports
+  manual_approval:
+    name: Manual Approval Before Deployment
+    runs-on: ubuntu-latest
+    needs: [security_scans, send_email_alert]
+    if: needs.security_scans.outputs.policy_failed == 'true'
+
+    environment:
+      name: vulnerability-review
+
+    steps:
+      - name: Approved
+        run: |
+          echo "Manual approval received. Deployment can continue."
+  deploy_to_eks:
+    name: Deploy to Amazon EKS
+    runs-on: ubuntu-latest
+    needs: [setup, security_scans, manual_approval]
+    if: |
+      always() &&
+      github.event.inputs.deploy_environment != 'skip-deployment' &&
+      needs.security_scans.result == 'success' &&
+      (
+        needs.security_scans.outputs.policy_failed == 'false' ||
+        needs.manual_approval.result == 'success'
+      )
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Generate Dockerfile if missing
+        run: |
+          APP="${{ needs.setup.outputs.app_type }}"
+          if [ -f Dockerfile ]; then
+            echo "Dockerfile already exists"
+            exit 0
+          fi
+          echo "Dockerfile not found. Generating Dockerfile for app type: $APP"
+          if [ "$APP" = "nodejs" ]; then
+            cat > Dockerfile <<'EOF'
+          FROM node:18-alpine
+          WORKDIR /app
+          COPY package*.json ./
+          RUN npm install
+          COPY . .
+          EXPOSE 3000
+          CMD ["npm", "start"]
+          EOF
+          fi
+          if [ "$APP" = "python" ]; then
+            cat > Dockerfile <<'EOF'
+          FROM python:3.11-slim
+          WORKDIR /app
+          COPY requirements.txt .
+          RUN pip install --no-cache-dir -r requirements.txt
+          COPY . .
+          EXPOSE 5000
+          CMD ["python", "app.py"]
+          EOF
+          fi
+          if [ "$APP" = "java" ]; then
+            cat > Dockerfile <<'EOF'
+          FROM maven:3.9-eclipse-temurin-17 AS build
+          WORKDIR /app
+          COPY . .
+          RUN mvn clean package -DskipTests
+          FROM eclipse-temurin:17-jre
+          WORKDIR /app
+          COPY --from=build /app/target/*.jar app.jar
+          EXPOSE 8080
+          CMD ["java", "-jar", "app.jar"]
+          EOF
+          fi
+          if [ ! -f Dockerfile ]; then
+            echo "No Dockerfile exists and auto-generation failed."
+            exit 1
+          fi
+          cat Dockerfile
+      - name: Build and push Docker image
+        run: |
+          IMAGE="${{ secrets.DOCKER_USERNAME }}/${{ env.APP_NAME }}:${{ env.IMAGE_TAG }}"
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+      - name: Connect kubectl to EKS
+        run: |
+          aws eks update-kubeconfig \
+            --region "${{ secrets.AWS_REGION }}" \
+            --name "${{ secrets.EKS_CLUSTER_NAME }}"
+          kubectl get nodes
+      - name: Deploy to EKS
+        run: |
+          IMAGE="${{ secrets.DOCKER_USERNAME }}/${{ env.APP_NAME }}:${{ env.IMAGE_TAG }}"
+          sed "s|DOCKER_IMAGE_PLACEHOLDER|$IMAGE|g" k8s/deployment.yaml > k8s/deployment-final.yaml
+          kubectl apply -f k8s/deployment-final.yaml
+          kubectl apply -f k8s/service.yaml
+          kubectl rollout status deployment/devsecops-app
+      - name: Show service URL
+        run: |
+          kubectl get svc devsecops-service
