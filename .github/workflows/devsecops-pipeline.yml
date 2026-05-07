@@ -12,8 +12,16 @@ jobs:
 
     steps:
 
+      # =========================
+      # CHECKOUT
+      # =========================
+
       - name: Checkout Source Code
         uses: actions/checkout@v4
+
+      # =========================
+      # DYNAMIC DETECTION
+      # =========================
 
       - name: Make Detection Script Executable
         run: chmod +x scripts/detect-tech.sh
@@ -30,25 +38,114 @@ jobs:
           echo "TERRAFORM=$TERRAFORM"
           echo "K8S=$K8S"
 
+      # =========================
+      # SETUP NODE
+      # =========================
+
       - name: Setup Node.js
         if: env.NODE == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Install Node.js Dependencies
+      - name: Install Dependencies
         if: env.NODE == 'true'
         run: npm install
+
+      # =========================
+      # CREATE REPORTS DIRECTORY
+      # =========================
+
+      - name: Create Reports Directory
+        run: mkdir -p reports
+
+      # =========================
+      # GITLEAKS SECRET SCAN
+      # =========================
+
+      - name: Gitleaks Secret Scan
+        uses: gitleaks/gitleaks-action@v2
+        continue-on-error: true
+
+      # =========================
+      # NPM AUDIT
+      # =========================
+
+      - name: Dependency Scan
+        if: env.NODE == 'true'
+        run: |
+          npm audit --json > reports/npm-audit.json
+        continue-on-error: true
+
+      # =========================
+      # TRIVY FILESYSTEM SCAN
+      # =========================
+
+      - name: Trivy Filesystem Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'json'
+          output: 'reports/trivy-fs.json'
+        continue-on-error: true
+
+      # =========================
+      # BUILD DOCKER IMAGE
+      # =========================
 
       - name: Build Docker Image
         if: env.DOCKER == 'true'
         run: |
           docker build -t fitness-tracker:${{ github.sha }} .
 
-      - name: Verify Kubernetes Manifests
+      # =========================
+      # TRIVY CONTAINER SCAN
+      # =========================
+
+      - name: Trivy Container Scan
+        if: env.DOCKER == 'true'
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'fitness-tracker:${{ github.sha }}'
+          format: 'json'
+          output: 'reports/trivy-image.json'
+        continue-on-error: true
+
+      # =========================
+      # CHECKOV IAC SCAN
+      # =========================
+
+      - name: Checkov IaC Scan
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          output_format: json
+          output_file_path: reports/checkov.json
+        continue-on-error: true
+
+      # =========================
+      # VERIFY K8S FILES
+      # =========================
+
+      - name: Verify Kubernetes Files
         if: env.K8S == 'true'
         run: |
           ls k8s/
 
+      # =========================
+      # UPLOAD REPORTS
+      # =========================
+
+      - name: Upload Security Reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: reports/
+
+      # =========================
+      # COMPLETE
+      # =========================
+
       - name: Pipeline Completed
-        run: echo "Enterprise dynamic pipeline executed successfully"
+        run: echo "Enterprise DevSecOps scanning completed successfully"
