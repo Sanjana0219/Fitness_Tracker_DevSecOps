@@ -1,10 +1,9 @@
-name: Dynamic DevSecOps Pipeline
+name: Enterprise DevSecOps Pipeline
 
 on:
   push:
     branches:
       - master
-  workflow_dispatch:
 
 jobs:
   devsecops-pipeline:
@@ -16,16 +15,40 @@ jobs:
       - name: Checkout Source Code
         uses: actions/checkout@v4
 
-      - name: Display Pipeline Start
-        run: echo "Starting Dynamic DevSecOps Pipeline"
+      - name: Make Detection Script Executable
+        run: chmod +x scripts/detect-tech.sh
 
-      - name: List Repository Files
-        run: ls -la
+      - name: Detect Application Technologies
+        run: ./scripts/detect-tech.sh
 
-      - name: Run Dynamic Technology Detection
-        shell: pwsh
+      - name: Display Detected Technologies
         run: |
-          ./scripts/detect-tech.ps1
+          echo "NODE=$NODE"
+          echo "PYTHON=$PYTHON"
+          echo "JAVA=$JAVA"
+          echo "DOCKER=$DOCKER"
+          echo "TERRAFORM=$TERRAFORM"
+          echo "K8S=$K8S"
 
-      - name: Pipeline Completion Message
-        run: echo "Dynamic Detection Completed Successfully"
+      - name: Setup Node.js
+        if: env.NODE == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Node.js Dependencies
+        if: env.NODE == 'true'
+        run: npm install
+
+      - name: Build Docker Image
+        if: env.DOCKER == 'true'
+        run: |
+          docker build -t fitness-tracker:${{ github.sha }} .
+
+      - name: Verify Kubernetes Manifests
+        if: env.K8S == 'true'
+        run: |
+          ls k8s/
+
+      - name: Pipeline Completed
+        run: echo "Enterprise dynamic pipeline executed successfully"
